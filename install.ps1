@@ -84,9 +84,9 @@ function Set-UserPath {
         return
     }
     if ($env:RITCODE_NO_MODIFY_PATH -ne '1') {
-        $newPath = if ($userPath) { "$userPath;$BinDir" } else { $BinDir }
+        $newPath = if ($userPath) { "$BinDir;$userPath" } else { $BinDir }
         [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-        $env:PATH = "$env:PATH;$BinDir"
+        $env:PATH = "$BinDir;$env:PATH"
         Say "RitCode: added $BinDir to your user PATH (open a new terminal to pick it up)"
     }
     else {
@@ -94,6 +94,18 @@ function Set-UserPath {
         Say "Add $BinDir to your PATH:"
         Say "  PowerShell  [Environment]::SetEnvironmentVariable('Path', `"`$env:PATH;$BinDir`", 'User')"
     }
+}
+
+function Warn-IfShadowed($installed) {
+    $active = Get-Command ritcode -ErrorAction SilentlyContinue
+    if (-not $active) { return }
+    if ($active.Source -ieq $installed) { return }
+    Write-Warning "another 'ritcode' is already on your PATH and will run instead of the one just installed:"
+    Write-Warning "    $($active.Source)"
+    Write-Warning "the binary just installed is at:"
+    Write-Warning "    $installed"
+    Write-Warning "remove the other one, or make sure $BinDir comes first in PATH."
+    Write-Warning "open a new terminal to pick up the updated PATH."
 }
 
 # ---- 5. main -----------------------------------------------------------------
@@ -142,6 +154,7 @@ try {
     Say "RitCode: installed to $dest"
 
     Set-UserPath
+    Warn-IfShadowed $dest
     Say ''
     Say 'Done. Start RitCode with:'
     Say '  ritcode'

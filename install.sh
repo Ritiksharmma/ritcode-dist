@@ -154,6 +154,7 @@ main() {
 	fi
 
 	setup_path
+	warn_if_shadowed
 	say ""
 	say "Done. Start RitCode with:"
 	say "  ritcode"
@@ -192,6 +193,22 @@ setup_path() {
 	say "  PowerShell  \$env:PATH = \"$BIN_DIR:\$env:PATH\"   (add to your \$PROFILE)"
 }
 
+# ---- 6. shadow warning -------------------------------------------------------
+
+# If some other `ritcode` earlier on PATH will run instead of the one we just
+# installed, say so loudly. Non-destructive: we never touch the other file.
+warn_if_shadowed() {
+	active=$(command -v ritcode 2>/dev/null || true)
+	[ -n "$active" ] || return 0
+	[ "$active" = "$BIN_DIR/ritcode" ] && return 0
+	warn "another 'ritcode' is already on your PATH and will run instead of the one just installed:"
+	warn "    $active"
+	warn "the binary just installed is at:"
+	warn "    $BIN_DIR/ritcode"
+	warn "remove the other one, or make sure $BIN_DIR comes first in PATH."
+	warn "a new shell picks up the updated PATH."
+}
+
 # The profile file for the current login shell, if we can pick one safely.
 detect_profile() {
 	shell_name=$(basename "${SHELL:-}")
@@ -203,5 +220,10 @@ detect_profile() {
 	*) echo "" ;;
 	esac
 }
+
+if [ "${RITCODE_SELFTEST_SHADOW:-0}" = "1" ]; then
+	warn_if_shadowed
+	exit 0
+fi
 
 main "$@"
