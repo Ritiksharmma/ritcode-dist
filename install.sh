@@ -4,7 +4,7 @@
 # Proprietary. (c) 2026 Ritik Sharma. All rights reserved.
 #
 # Downloads the prebuilt `ritcode` binary from GitHub Releases, verifies its
-# SHA256 before trusting it, and installs it user-local with no sudo:
+# SHA256 and a detached publisher signature before trusting it, and installs it user-local with no sudo:
 #
 #     curl -fsSL https://raw.githubusercontent.com/ritiksharmma/ritcode-dist/main/install.sh | sh
 #
@@ -84,6 +84,14 @@ sha256_of() {
 	fi
 }
 
+verify_signature() {
+	archive=$1
+	signature=$2
+	key=$3
+	openssl pkeyutl -verify -rawin -pubin -inkey "$key" -in "$archive" -sigfile "$signature" >/dev/null 2>&1 ||
+		die "publisher signature verification failed (refusing to install)"
+}
+
 # Reject absolute paths and any `..` component before extracting anything.
 # Loops in the main shell (not a pipe subshell) so `die` truly aborts.
 assert_safe_archive() {
@@ -112,18 +120,28 @@ main() {
 
 	archive_url=$(printf '%s\n' "$urls" | grep -E "${target}\.tar\.gz$" | head -n1 || true)
 	sha_url=$(printf '%s\n' "$urls" | grep -E "${target}\.tar\.gz\.sha256$" | head -n1 || true)
+	sig_url=$(printf '%s\n' "$urls" | grep -E "${target}\.tar\.gz\.sig$" | head -n1 || true)
 	[ -n "$archive_url" ] || die "no archive asset found for $target in the release"
 	[ -n "$sha_url" ] || die "no checksum asset found for $target in the release"
+	[ -n "$sig_url" ] || die "no publisher signature found for $target in the release"
 
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/ritcode.XXXXXX") || die "could not create a temp dir"
 	trap 'rm -rf "$tmp"' EXIT INT TERM
 
 	archive="$tmp/$(basename "$archive_url")"
 	sha_file="$tmp/$(basename "$sha_url")"
+	sig_file="$tmp/$(basename "$sig_url")"
+	key_file="$tmp/release-signing-public.pem"
 
 	say "RitCode: downloading $(basename "$archive_url")"
 	curl -fsSL "$archive_url" -o "$archive" || die "download failed: $archive_url"
 	curl -fsSL "$sha_url" -o "$sha_file" || die "checksum download failed: $sha_url"
+	curl -fsSL "$sig_url" -o "$sig_file" || die "signature download failed: $sig_url"
+	cat > "$key_file" <<'EOF'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAI56hp9iLXPr1x0u8HFsVsQ1PmtmF93gAJpwojrwBMX8=
+-----END PUBLIC KEY-----
+EOF
 
 	expected=$(awk '{print $1}' "$sha_file")
 	actual=$(sha256_of "$archive")
@@ -132,6 +150,9 @@ main() {
 		die "checksum mismatch: expected $expected, got $actual (refusing to install)"
 	fi
 	say "RitCode: checksum verified"
+	need openssl
+	verify_signature "$archive" "$sig_file" "$key_file"
+	say "RitCode: publisher signature verified"
 
 	assert_safe_archive "$archive"
 	mkdir -p "$tmp/extract"
@@ -145,6 +166,8 @@ main() {
 	mkdir -p "$BIN_DIR"
 	mv "$bin_src" "$BIN_DIR/ritcode"
 	chmod +x "$BIN_DIR/ritcode"
+	# Sentinel so `ritcode uninstall` only deletes a real install home (H18).
+	printf 'ritcode-install\n' >"$HOME_DIR/.ritcode-install"
 	say "RitCode: installed to $BIN_DIR/ritcode"
 
 	# macOS: clear the quarantine flag so Gatekeeper does not block first run.

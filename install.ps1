@@ -3,6 +3,7 @@
 # Proprietary. (c) 2026 Ritik Sharma. All rights reserved.
 #
 # Downloads the prebuilt ritcode.exe from GitHub Releases, verifies its SHA256
+# and detached publisher signature
 # before trusting it, and installs it user-local with no admin:
 #
 #     irm https://raw.githubusercontent.com/ritiksharmma/ritcode-dist/main/install.ps1 | iex
@@ -76,6 +77,13 @@ function Assert-SafeZip($zipPath) {
     }
 }
 
+function Verify-PublisherSignature($archive, $signature, $publicKey) {
+    $openssl = Get-Command openssl -ErrorAction SilentlyContinue
+    if (-not $openssl) { Fail 'OpenSSL is required to verify the publisher signature' }
+    & $openssl.Source pkeyutl -verify -rawin -pubin -inkey $publicKey -in $archive -sigfile $signature | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'publisher signature verification failed (refusing to install)' }
+}
+
 # ---- 4. PATH handling --------------------------------------------------------
 
 function Set-UserPath {
@@ -121,16 +129,26 @@ if (-not $archiveAsset) {
 if (-not $archiveAsset) { Fail "no archive asset found for $target in the release" }
 $shaAsset = $release.assets | Where-Object { $_.name -eq "$($archiveAsset.name).sha256" } | Select-Object -First 1
 if (-not $shaAsset) { Fail "no checksum asset found for $($archiveAsset.name)" }
+$sigAsset = $release.assets | Where-Object { $_.name -eq "$($archiveAsset.name).sig" } | Select-Object -First 1
+if (-not $sigAsset) { Fail "no publisher signature found for $($archiveAsset.name)" }
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("ritcode-" + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     $archive = Join-Path $tmp $archiveAsset.name
     $shaFile = Join-Path $tmp $shaAsset.name
+    $sigFile = Join-Path $tmp $sigAsset.name
+    $keyFile = Join-Path $tmp 'release-signing-public.pem'
 
     Say "RitCode: downloading $($archiveAsset.name)"
     Invoke-WebRequest -Uri $archiveAsset.browser_download_url -OutFile $archive -Headers @{ 'User-Agent' = 'ritcode-installer' }
     Invoke-WebRequest -Uri $shaAsset.browser_download_url -OutFile $shaFile -Headers @{ 'User-Agent' = 'ritcode-installer' }
+    Invoke-WebRequest -Uri $sigAsset.browser_download_url -OutFile $sigFile -Headers @{ 'User-Agent' = 'ritcode-installer' }
+    @'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAI56hp9iLXPr1x0u8HFsVsQ1PmtmF93gAJpwojrwBMX8=
+-----END PUBLIC KEY-----
+'@ | Set-Content -Path $keyFile -NoNewline
 
     $expected = ((Get-Content $shaFile -Raw).Trim() -split '\s+')[0]
     $actual = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLower()
@@ -139,6 +157,8 @@ try {
         Fail "checksum mismatch: expected $expected, got $actual (refusing to install)"
     }
     Say 'RitCode: checksum verified'
+    Verify-PublisherSignature $archive $sigFile $keyFile
+    Say 'RitCode: publisher signature verified'
 
     Assert-SafeZip $archive
     $extract = Join-Path $tmp 'extract'
