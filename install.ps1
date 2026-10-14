@@ -22,6 +22,12 @@ $Api = "https://api.github.com/repos/$Repo"
 $HomeDir = if ($env:RITCODE_HOME) { $env:RITCODE_HOME } else { Join-Path $env:USERPROFILE '.ritcode' }
 $BinDir = Join-Path $HomeDir 'bin'
 
+# Archive ceilings (M17): refuse absurd downloads / zip bombs before extract.
+$MaxArchiveBytes = 100MB
+$MaxUnpackedBytes = 200MB
+$MaxArchiveEntries = 256
+$MaxSingleFileBytes = 100MB
+
 function Fail($msg) { Write-Error "error: $msg"; exit 1 }
 function Say($msg) { Write-Host $msg }
 
@@ -60,15 +66,33 @@ function Resolve-Release {
 # ---- 3. path-traversal guard for the zip -------------------------------------
 
 function Assert-SafeZip($zipPath) {
+    $fileLen = (Get-Item -LiteralPath $zipPath).Length
+    if ($fileLen -gt $MaxArchiveBytes) {
+        Fail "archive exceeds download ceiling ($fileLen > $MaxArchiveBytes bytes)"
+    }
+
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
+        $count = 0
+        $totalUnpacked = [int64]0
         foreach ($entry in $zip.Entries) {
+            $count++
+            if ($count -gt $MaxArchiveEntries) {
+                Fail "archive has too many entries (max $MaxArchiveEntries)"
+            }
             $name = $entry.FullName
             if ($name -match '(^|[\\/])\.\.([\\/]|$)' -or
                 $name -match '^[\\/]' -or
                 $name -match '^[A-Za-z]:') {
                 Fail "unsafe archive entry rejected: $name"
+            }
+            if ($entry.Length -gt $MaxSingleFileBytes) {
+                Fail "archive entry exceeds size ceiling: $name ($($entry.Length) bytes)"
+            }
+            $totalUnpacked += $entry.Length
+            if ($totalUnpacked -gt $MaxUnpackedBytes) {
+                Fail "archive uncompressed size exceeds ceiling ($totalUnpacked > $MaxUnpackedBytes bytes)"
             }
         }
     }
@@ -141,7 +165,13 @@ try {
     $keyFile = Join-Path $tmp 'release-signing-public.pem'
 
     Say "RitCode: downloading $($archiveAsset.name)"
+    if ($archiveAsset.size -and [int64]$archiveAsset.size -gt $MaxArchiveBytes) {
+        Fail "release asset exceeds download ceiling ($($archiveAsset.size) > $MaxArchiveBytes bytes)"
+    }
     Invoke-WebRequest -Uri $archiveAsset.browser_download_url -OutFile $archive -Headers @{ 'User-Agent' = 'ritcode-installer' }
+    if ((Get-Item -LiteralPath $archive).Length -gt $MaxArchiveBytes) {
+        Fail "downloaded archive exceeds size ceiling"
+    }
     Invoke-WebRequest -Uri $shaAsset.browser_download_url -OutFile $shaFile -Headers @{ 'User-Agent' = 'ritcode-installer' }
     Invoke-WebRequest -Uri $sigAsset.browser_download_url -OutFile $sigFile -Headers @{ 'User-Agent' = 'ritcode-installer' }
     @'

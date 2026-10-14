@@ -20,6 +20,12 @@ API="https://api.github.com/repos/${REPO}"
 HOME_DIR="${RITCODE_HOME:-$HOME/.ritcode}"
 BIN_DIR="$HOME_DIR/bin"
 
+# Archive ceilings (M17): refuse absurd downloads / zip bombs before extract.
+MAX_ARCHIVE_BYTES=104857600    # 100 MiB compressed
+MAX_UNPACKED_BYTES=209715200   # 200 MiB gzip-reported uncompressed
+MAX_ARCHIVE_ENTRIES=256
+MAX_SINGLE_FILE_BYTES=104857600 # 100 MiB per extracted file
+
 say() { printf '%s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die() {
@@ -92,19 +98,62 @@ verify_signature() {
 		die "publisher signature verification failed (refusing to install)"
 }
 
-# Reject absolute paths and any `..` component before extracting anything.
+# Reject absolute paths, `..` components, and archives that expand too large.
 # Loops in the main shell (not a pipe subshell) so `die` truly aborts.
 assert_safe_archive() {
-	entries=$(tar -tzf "$1") || die "could not read archive contents"
+	archive=$1
+	size=$(wc -c <"$archive" | tr -d ' \n')
+	case "$size" in
+	'' | *[!0-9]*) die "could not determine archive size" ;;
+	esac
+	if [ "$size" -gt "$MAX_ARCHIVE_BYTES" ]; then
+		die "archive exceeds download ceiling ($size > $MAX_ARCHIVE_BYTES bytes)"
+	fi
+
+	# gzip -l reports the uncompressed tar stream size (good zip-bomb signal).
+	if command -v gzip >/dev/null 2>&1; then
+		uc=$(gzip -l "$archive" 2>/dev/null | awk 'NR==2 {print $2}')
+		case "$uc" in
+		'' | *[!0-9]*) : ;; # older/odd gzip; fall through to entry checks
+		*)
+			if [ "$uc" -gt "$MAX_UNPACKED_BYTES" ]; then
+				die "archive uncompressed size exceeds ceiling ($uc > $MAX_UNPACKED_BYTES bytes)"
+			fi
+			;;
+		esac
+	fi
+
+	entries=$(tar -tzf "$archive") || die "could not read archive contents"
+	count=0
 	oldifs=$IFS
 	IFS='
 '
 	for entry in $entries; do
+		count=$((count + 1))
+		if [ "$count" -gt "$MAX_ARCHIVE_ENTRIES" ]; then
+			die "archive has too many entries (max $MAX_ARCHIVE_ENTRIES)"
+		fi
 		case "$entry" in
 		/* | ../* | */../* | */.. | ..) die "unsafe archive entry rejected: $entry" ;;
 		esac
 	done
 	IFS=$oldifs
+}
+
+# After extract: refuse any single file over the per-file ceiling.
+assert_extracted_ceilings() {
+	dir=$1
+	# Portable find; loop in this shell so die aborts the installer.
+	# shellcheck disable=SC2044
+	for f in $(find "$dir" -type f 2>/dev/null); do
+		sz=$(wc -c <"$f" | tr -d ' \n')
+		case "$sz" in
+		'' | *[!0-9]*) continue ;;
+		esac
+		if [ "$sz" -gt "$MAX_SINGLE_FILE_BYTES" ]; then
+			die "extracted file exceeds size ceiling: $f ($sz bytes)"
+		fi
+	done
 }
 
 main() {
@@ -134,9 +183,13 @@ main() {
 	key_file="$tmp/release-signing-public.pem"
 
 	say "RitCode: downloading $(basename "$archive_url")"
-	curl -fsSL "$archive_url" -o "$archive" || die "download failed: $archive_url"
-	curl -fsSL "$sha_url" -o "$sha_file" || die "checksum download failed: $sha_url"
-	curl -fsSL "$sig_url" -o "$sig_file" || die "signature download failed: $sig_url"
+	# --max-filesize aborts early on oversized responses (curl 7.10+).
+	curl -fsSL --max-filesize "$MAX_ARCHIVE_BYTES" "$archive_url" -o "$archive" ||
+		die "download failed: $archive_url"
+	curl -fsSL --max-filesize 1048576 "$sha_url" -o "$sha_file" ||
+		die "checksum download failed: $sha_url"
+	curl -fsSL --max-filesize 1048576 "$sig_url" -o "$sig_file" ||
+		die "signature download failed: $sig_url"
 	cat > "$key_file" <<'EOF'
 -----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAI56hp9iLXPr1x0u8HFsVsQ1PmtmF93gAJpwojrwBMX8=
@@ -157,6 +210,7 @@ EOF
 	assert_safe_archive "$archive"
 	mkdir -p "$tmp/extract"
 	tar -xzf "$archive" -C "$tmp/extract" || die "extraction failed"
+	assert_extracted_ceilings "$tmp/extract"
 
 	bin_src=$(find "$tmp/extract" -type f -name ritcode | head -n1 || true)
 	[ -n "$bin_src" ] || die "no ritcode binary inside the archive"
